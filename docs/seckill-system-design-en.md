@@ -42,9 +42,9 @@ Seckill (flash sale) is a common marketing activity characterized by:
 │  3. Atomic operation: inventory deduction + user marking (Lua script)  │
 │     - Insufficient inventory → return "Sold Out"                        │
 │     - User already purchased → return "Already Participated"           │
-│  4. Save to local message table (status: to be sent)                    │
+│  4. Send RocketMQ transaction message (Half message → Local transaction → Real message) │
 │  5. Send RocketMQ → auto retry 3 times on failure                       │
-│     - All retries failed → rollback inventory + remove user mark       │
+│     - Transaction failed → rollback inventory + remove user mark         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                           MQ Consumer                                    │
 ├─────────────────────────────────────────────────────────────────────────┤
@@ -55,10 +55,9 @@ Seckill (flash sale) is a common marketing activity characterized by:
 ├─────────────────────────────────────────────────────────────────────────┤
 │                           Scheduled Tasks                                │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  - Message compensation: scan to-be-sent messages every 30s            │
 │  - Order rollback: check expired orders every 1min, rollback inventory │
-│  - Inventory reconciliation: compare Redis/MySQL every 5min,           │
-│    auto compensate + alert if inconsistent                              │
+│  - Inventory reconciliation: compare Redis/MySQL every 5min,          │
+│    auto compensate + alert if inconsistent                             │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -132,20 +131,39 @@ public SeckillResult seckill(SeckillRequest request) {
         return SeckillResult.alreadyPurchased();
     }
 
-    // 4. Save to local message table
-    LocalMessage msg = createLocalMessage(skuId, userId);
-    localMessageMapper.insert(msg);
+    // 4. Send RocketMQ transaction message
+    SeckillMessage msg = new SeckillMessage();
+    msg.setOrderId(generateOrderId(skuId, userId));
+    msg.setSkuId(skuId);
+    msg.setUserId(userId);
 
-    // 5. Send MQ (auto retry on failure)
+    Message message = new Message("seckill_topic", JSON.toJSONString(msg).getBytes());
+    message.putUserProperty("orderId", msg.getOrderId());
+
     try {
-        rocketMQProducer.send("seckill_topic", msg);
-        localMessageMapper.updateStatus(msg.getId(), 1);
-        return SeckillResult.success(msg.getOrderId());
+        TransactionSendResult result = rocketMQTemplate.sendMessageInTransaction(
+            "seckill_group", message, null);
+        if (result.getSendStatus() == SendStatus.SEND_OK) {
+            return SeckillResult.success(msg.getOrderId());
+        }
     } catch (Exception e) {
-        // All retries failed, rollback
-        rollbackStockAndUser(skuId, userId);
-        return SeckillResult.systemBusy();
+        log.error("Transaction message send failed", e);
     }
+
+    // Transaction failed, rollback
+    rollbackStockAndUser(skuId, userId);
+    return SeckillResult.systemBusy();
+}
+
+/**
+ * Generate order ID
+ * Format: SKU_ID + userId hash + timestamp + random number
+ */
+private String generateOrderId(String skuId, String userId) {
+    long timestamp = System.currentTimeMillis();
+    int hash = userId.hashCode();
+    int random = (int) (Math.random() * 9000) + 1000;
+    return String.format("%s_%d_%d_%d", skuId, hash, timestamp, random);
 }
 ```
 
@@ -250,28 +268,95 @@ private static final String ROLLBACK_SCRIPT = """
     """;
 ```
 
----
-
-## 5. Scheduled Tasks
-
-### 5.1 Message Compensation
+### 4.7 RocketMQ Transaction Listener
 
 ```java
-@Scheduled(cron = "0/30 * * * * ?")
-public void compensateMessage() {
-    List<LocalMessage> pendingMessages = localMessageMapper.findByStatus(0);
-    for (LocalMessage msg : pendingMessages) {
+@RocketMQTransactionListener(txProducerGroup = "seckill_group")
+public class SeckillTransactionListener implements RocketMQLocalTransactionListener {
+
+    @Autowired
+    private OrderMapper orderMapper;
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        String orderId = msg.getHeaders().get("orderId", String.class);
         try {
-            rocketMQProducer.send("seckill_topic", msg);
-            localMessageMapper.updateStatus(msg.getId(), 1);
+            // 1. Parse message
+            SeckillMessage seckillMsg = JSON.parseObject(
+                new String(msg.getBody()), SeckillMessage.class);
+
+            // 2. MySQL inventory deduction (prevent overselling)
+            int affected = productMapper.decrementStock(seckillMsg.getSkuId());
+            if (affected == 0) {
+                // Insufficient inventory, rollback Redis
+                rollbackStockAndUser(seckillMsg.getSkuId(), seckillMsg.getUserId());
+                return RocketMQLocalTransactionState.ROLLBACK;
+            }
+
+            // 3. Create order
+            Order order = new Order();
+            order.setOrderId(seckillMsg.getOrderId());
+            order.setUserId(seckillMsg.getUserId());
+            order.setSkuId(seckillMsg.getSkuId());
+            order.setStatus(OrderStatus.PENDING_PAY);
+            order.setExpireTime(LocalDateTime.now().plusMinutes(15));
+            orderMapper.insert(order);
+
+            return RocketMQLocalTransactionState.COMMIT;
         } catch (Exception e) {
-            log.error("Message compensation failed", e);
+            log.error("Local transaction execution failed, orderId: {}", orderId, e);
+            return RocketMQLocalTransactionState.ROLLBACK;
         }
+    }
+
+    @Override
+    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {
+        // Transaction check: verify if local transaction succeeded based on order ID
+        String orderId = msg.getHeaders().get("orderId", String.class);
+        try {
+            Order order = orderMapper.findByOrderId(orderId);
+            if (order != null) {
+                return RocketMQLocalTransactionState.COMMIT;
+            }
+        } catch (Exception e) {
+            log.error("Transaction check failed, orderId: {}", orderId, e);
+        }
+        return RocketMQLocalTransactionState.UNKNOWN;
+    }
+
+    /**
+     * Rollback inventory and user mark (atomic operation)
+     */
+    private void rollbackStockAndUser(String skuId, String userId) {
+        String stockKey = "seckill:stock:" + skuId;
+        String userKey = "seckill:users:" + skuId;
+
+        String script = """
+            if redis.call('sismember', KEYS[2], ARGV[1]) == 0 then
+                return 0
+            end
+            redis.call('incr', KEYS[1])
+            redis.call('srem', KEYS[2], ARGV[1])
+            return 1
+            """;
+
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>(script, Long.class);
+        redisTemplate.execute(redisScript, Arrays.asList(stockKey, userKey), userId);
     }
 }
 ```
 
-### 5.2 Expired Order Rollback
+---
+
+## 5. Scheduled Tasks
+
+### 5.1 Expired Order Rollback
 
 ```java
 @Scheduled(cron = "0 * * * * ?")
@@ -290,7 +375,7 @@ public void rollbackExpiredOrders() {
 }
 ```
 
-### 5.3 Inventory Reconciliation + Auto Compensation
+### 5.2 Inventory Reconciliation + Auto Compensation
 
 ```java
 @Scheduled(cron = "0 0/5 * * * ?")
@@ -368,7 +453,7 @@ CREATE TABLE `order` (
 ) COMMENT 'Order table';
 ```
 
-### 7.2 Local Message Table
+### 7.2 Local Message Table (Optional, retained for Debug)
 
 ```sql
 CREATE TABLE `local_message` (
@@ -380,8 +465,10 @@ CREATE TABLE `local_message` (
     `created_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
     `updated_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY `uk_order_id` (`order_id`)
-) COMMENT 'Local message table';
+) COMMENT 'Local message table (deprecated, only for debugging)';
 ```
+
+> **Note**: After adopting RocketMQ transaction messages, local message table is no longer required. It can be retained for issue investigation.
 
 ---
 
@@ -491,55 +578,84 @@ Exception - Order timeout unpaid:
 
 ---
 
-### 8.4 Transaction Message Rollback
+### 8.4 Transaction Message Solution
 
 #### Problem Description
-MQ sending may fail during seckill process, need to ensure message reliability and transaction consistency.
+Need to ensure distributed transaction consistency among Redis deduction, MySQL order creation, and MQ messages during seckill process.
 
-#### Solution: Local Message Table + Scheduled Compensation
+#### Solution: RocketMQ Transaction Message
 
-**Message State Machine**
-```
-┌────────────┐   Sent Successfully   ┌────────────┐
-│  To Send  │ ──────────────────▶  │   Sent     │
-│(status=0) │                      │(status=1)  │
-└────────────┘                      └────────────┘
-     ↑                                   │
-     │    RocketMQ Retry Failed          │
-     └───────────────────────────────────┘
-     │                                   │
-     │    Scheduled Task Scan            │
-     └───────────────────────────────────┘
-```
+RocketMQ transaction messages ensure eventual consistency between local transactions and message sending through "Half Message" mechanism.
 
-**Status Update (Idempotent)**
-```sql
--- Only status=0 can be updated to 1, prevent concurrent overwrite
-UPDATE local_message SET status = 1, updated_time = NOW()
-WHERE id = ? AND status = 0;
+**Transaction Message Flow**
 ```
-
-**Scheduled Compensation Flow**
-```
-1. Scan messages with status=0
-2. Resend to RocketMQ
-3. Update status=1 on success
-4. Continue waiting for next compensation on failure
+┌─────────────┐     Half Message     ┌─────────────┐
+│  Seckill    │ ────────────────▶  │   RocketMQ  │
+│   Request   │    (Prepared)       │  Tx Log     │
+└──────┬──────┘                     └──────┬──────┘
+       │                                    │
+       ▼                                    │
+┌─────────────┐                             │
+│  Local Tx   │                             │
+│ (Deduct     │                             │
+│  MySQL +    │                             │
+│  Create     │                             │
+│  Order)     │                             │
+└──────┬──────┘                             │
+       │   Commit Success                    │
+       ├────────────────────────────────────┤
+       │                                    │
+       ▼                              Send Real Message
+                          ┌─────────────┐
+                          │  Consumer   │
+                          │  Subscribe  │
+                          └─────────────┘
 ```
 
-**MQ Send Failure Rollback**
-```java
-try {
-    rocketMQProducer.send("seckill_topic", msg);
-    // Status update needs condition, prevent concurrent overwrite
-    localMessageMapper.updateStatusIfMatch(msg.getId(), 1, 0);
-} catch (Exception e) {
-    // RocketMQ will auto retry 3 times
-    // After all retries failed, mark status and rollback Redis
-    localMessageMapper.updateStatus(msg.getId(), -1);
-    rollbackStockAndUser(skuId, userId);
-}
+**Transaction Message State Machine**
 ```
+┌──────────┐   Commit Success    ┌──────────┐
+│  Half    │ ─────────────────▶  │  Commit  │
+│  Message  │                     │ (Committed) │
+└──────────┘                     └──────────┘
+       │                               │
+       │   Rollback/Unknown            │
+       ├───────────────────────────────┤
+       │                               │
+       ▼                               ▼
+┌──────────┐                    ┌──────────┐
+│ Rollback │                    │  Commit  │
+│(Rolled  )│                    │(Committed) │
+└──────────┘                    └──────────┘
+```
+
+**Transaction Listener Execution Flow**
+```
+1. Half message sent successfully
+2. Execute local transaction (MySQL deduct inventory + create order)
+   - Success → Return COMMIT, RocketMQ sends real message
+   - Failure → Return ROLLBACK, message discarded
+   - Timeout/Exception → Return UNKNOWN, trigger check
+3. Check: verify if order exists
+   - Order exists → Return COMMIT
+   - Order not exists → Return ROLLBACK
+```
+
+**See Section 4.7 for key code**
+
+**Solution Comparison**
+
+| Comparison | Local Message Table + Compensation | RocketMQ Transaction Message |
+|------------|-----------------------------------|------------------------------|
+| Implementation Complexity | Medium (maintain message table + scheduled tasks) | Low (native MQ support) |
+| Consistency | Eventual consistency | Eventual consistency |
+| Latency | Scheduled compensation has delay | Real-time |
+| Reliability | Message table + compensation dual guarantee | Depends on MQ stability |
+| Ops Cost | Monitor message table | RocketMQ HA |
+
+**Recommended Scenarios**
+- Small-scale seckill: Local message table is sufficient, simple and controllable
+- Large-scale seckill: RocketMQ transaction message is better, less latency and ops cost
 
 ---
 
@@ -619,9 +735,9 @@ Degradation notes:
 | Redis Set | O(1) complexity to check if user has purchased |
 | Rate limiting & anti-brush | Fixed window rate limiting + IP/Device dimension anti-brush |
 | MQ async | Peak shaving, protects MySQL |
-| Local message table | Ensures reliable message sending |
+| RocketMQ transaction message | Half message mechanism ensures local tx and message consistency |
 | Idempotent design | Order ID unique index prevents duplicate creation |
-| Scheduled compensation | Message compensation + order timeout rollback + inventory reconciliation |
+| Scheduled tasks | Order timeout rollback + inventory reconciliation |
 | Degradation strategy | Fallback to MySQL when Redis fails |
 
 ---
@@ -635,7 +751,7 @@ Degradation notes:
 | 3 | Anti-brush | IP/Device 10 times per minute |
 | 4 | Inventory deduction | Lua script atomic operation + MySQL WHERE stock > 0 |
 | 5 | Duplicate purchase | Redis Set + Lua script check |
-| 6 | MQ retry | RocketMQ auto retry 3 times, rollback on failure |
+| 6 | Message reliability | RocketMQ transaction message (Half message + check) |
 | 7 | Consumer idempotency | Order ID unique index |
 | 8 | Degradation strategy | Redis failure fallback to MySQL |
 | 9 | Order timeout | Rollback inventory after 15 minutes without payment |

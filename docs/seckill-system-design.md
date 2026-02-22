@@ -42,9 +42,9 @@
 │  3. 原子操作：库存扣减 + 用户标记（Lua脚本）                             │
 │     - 库存不足 → 返回"已抢光"                                           │
 │     - 用户已购买 → 返回"您已参与"                                       │
-│  4. 保存本地消息表（状态：待发送）                                      │
+│  4. 发送RocketMQ事务消息（Half消息 → 本地事务 → 真实消息）           │
 │  5. 发送RocketMQ → 失败自动重试3次                                      │
-│     - 重试全部失败 → 回滚库存+移除用户标记                              │
+│     - 事务失败 → 回滚库存+移除用户标记                              │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                           MQ消费                                         │
 ├─────────────────────────────────────────────────────────────────────────┤
@@ -55,7 +55,6 @@
 ├─────────────────────────────────────────────────────────────────────────┤
 │                           定时任务                                       │
 ├─────────────────────────────────────────────────────────────────────────┤
-│  - 消息补偿：每30秒扫描待发送消息，重发MQ                                │
 │  - 订单回滚：每1分钟检查超时订单，回滚库存                               │
 │  - 库存对账：每5分钟比对Redis/MySQL，不一致自动补偿+告警                 │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -130,20 +129,39 @@ public SeckillResult seckill(SeckillRequest request) {
         return SeckillResult.alreadyPurchased();
     }
 
-    // 4. 保存本地消息表
-    LocalMessage msg = createLocalMessage(skuId, userId);
-    localMessageMapper.insert(msg);
+    // 4. 发送RocketMQ事务消息
+    SeckillMessage msg = new SeckillMessage();
+    msg.setOrderId(generateOrderId(skuId, userId));
+    msg.setSkuId(skuId);
+    msg.setUserId(userId);
 
-    // 5. 发送MQ（失败自动重试）
+    Message message = new Message("seckill_topic", JSON.toJSONString(msg).getBytes());
+    message.putUserProperty("orderId", msg.getOrderId());
+
     try {
-        rocketMQProducer.send("seckill_topic", msg);
-        localMessageMapper.updateStatus(msg.getId(), 1);
-        return SeckillResult.success(msg.getOrderId());
+        TransactionSendResult result = rocketMQTemplate.sendMessageInTransaction(
+            "seckill_group", message, null);
+        if (result.getSendStatus() == SendStatus.SEND_OK) {
+            return SeckillResult.success(msg.getOrderId());
+        }
     } catch (Exception e) {
-        // 重试全部失败，回滚
-        rollbackStockAndUser(skuId, userId);
-        return SeckillResult.systemBusy();
+        log.error("事务消息发送失败", e);
     }
+
+    // 事务失败，回滚
+    rollbackStockAndUser(skuId, userId);
+    return SeckillResult.systemBusy();
+}
+
+/**
+ * 生成订单号
+ * 格式：SKU_ID + 用户ID哈希 + 时间戳 + 随机数
+ */
+private String generateOrderId(String skuId, String userId) {
+    long timestamp = System.currentTimeMillis();
+    int hash = userId.hashCode();
+    int random = (int) (Math.random() * 9000) + 1000;
+    return String.format("%s_%d_%d_%d", skuId, hash, timestamp, random);
 }
 ```
 
@@ -248,28 +266,93 @@ private static final String ROLLBACK_SCRIPT = """
     """;
 ```
 
----
-
-## 五、定时任务
-
-### 5.1 消息补偿
+### 4.7 RocketMQ事务监听器
 
 ```java
-@Scheduled(cron = "0/30 * * * * ?")
-public void compensateMessage() {
-    List<LocalMessage> pendingMessages = localMessageMapper.findByStatus(0);
-    for (LocalMessage msg : pendingMessages) {
+@RocketMQTransactionListener(txProducerGroup = "seckill_group")
+public class SeckillTransactionListener implements RocketMQLocalTransactionListener {
+
+    @Autowired
+    private OrderMapper orderMapper;
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    @Autowired
+    private RedisTemplate<String, Object> redisTemplate;
+
+    @Override
+    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        String orderId = msg.getHeaders().get("orderId", String.class);
         try {
-            rocketMQProducer.send("seckill_topic", msg);
-            localMessageMapper.updateStatus(msg.getId(), 1);
+            // 1. 解析消息
+            SeckillMessage seckillMsg = JSON.parseObject(
+                new String(msg.getBody()), SeckillMessage.class);
+
+            // 2. MySQL库存扣减（防超卖）
+            int affected = productMapper.decrementStock(seckillMsg.getSkuId());
+            if (affected == 0) {
+                // 库存不足，回滚Redis
+                rollbackStockAndUser(seckillMsg.getSkuId(), seckillMsg.getUserId());
+                return RocketMQLocalTransactionState.ROLLBACK;
+            }
+
+            // 3. 创建订单
+            Order order = new Order();
+            order.setOrderId(seckillMsg.getOrderId());
+            order.setUserId(seckillMsg.getUserId());
+            order.setSkuId(seckillMsg.getSkuId());
+            order.setStatus(OrderStatus.PENDING_PAY);
+            order.setExpireTime(LocalDateTime.now().plusMinutes(15));
+            orderMapper.insert(order);
+
+            return RocketMQLocalTransactionState.COMMIT;
         } catch (Exception e) {
-            log.error("消息补偿失败", e);
+            log.error("本地事务执行失败, orderId: {}", orderId, e);
+            return RocketMQLocalTransactionState.ROLLBACK;
         }
+    }
+
+    @Override
+    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {
+        // 事务回查：根据订单号检查本地事务是否成功
+        String orderId = msg.getHeaders().get("orderId", String.class);
+        try {
+            Order order = orderMapper.findByOrderId(orderId);
+            if (order != null) {
+                return RocketMQLocalTransactionState.COMMIT;
+            }
+        } catch (Exception e) {
+            log.error("事务回查失败, orderId: {}", orderId, e);
+        }
+        return RocketMQLocalTransactionState.UNKNOWN;
+    }
+
+    /**
+     * 回滚库存和用户标记（原子操作）
+     */
+    private void rollbackStockAndUser(String skuId, String userId) {
+        String stockKey = "seckill:stock:" + skuId;
+        String userKey = "seckill:users:" + skuId;
+
+        String script = """
+            if redis.call('sismember', KEYS[2], ARGV[1]) == 0 then
+                return 0
+            end
+            redis.call('incr', KEYS[1])
+            redis.call('srem', KEYS[2], ARGV[1])
+            return 1
+            """;
+
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>(script, Long.class);
+        redisTemplate.execute(redisScript, Arrays.asList(stockKey, userKey), userId);
     }
 }
 ```
 
-### 5.2 超时订单回滚
+---
+
+### 5.1 超时订单回滚
 
 ```java
 @Scheduled(cron = "0 * * * * ?")
@@ -288,7 +371,7 @@ public void rollbackExpiredOrders() {
 }
 ```
 
-### 5.3 库存对账+自动补偿
+### 5.2 库存对账+自动补偿
 
 ```java
 @Scheduled(cron = "0 0/5 * * * ?")
@@ -366,7 +449,7 @@ CREATE TABLE `order` (
 ) COMMENT '订单表';
 ```
 
-### 7.2 本地消息表
+### 7.2 本地消息表（可选，保留用于Debug）
 
 ```sql
 CREATE TABLE `local_message` (
@@ -378,8 +461,10 @@ CREATE TABLE `local_message` (
     `created_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
     `updated_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY `uk_order_id` (`order_id`)
-) COMMENT '本地消息表';
+) COMMENT '本地消息表（已废弃，仅用于Debug）';
 ```
+
+> **注意**：采用RocketMQ事务消息后，本地消息表已不再需要，可保留用于问题排查。
 
 ---
 
@@ -489,55 +574,81 @@ redis.call('sadd', userKey, userId)
 
 ---
 
-### 8.4 事务消息回滚
+### 8.4 事务消息方案
 
 #### 问题描述
-秒杀流程中，MQ发送可能失败，需要保证消息可靠性和事务一致性。
+秒杀流程中，需要保证Redis扣减、MySQL下单、MQ消息的分布式事务一致性。
 
-#### 解决方案：本地消息表 + 定时补偿
+#### 解决方案：RocketMQ事务消息
 
-**消息状态机**
+RocketMQ事务消息通过"半消息(Half Message)"机制保证本地事务与消息发送的最终一致性。
+
+**事务消息流程**
 ```
-┌──────────┐   发送成功    ┌──────────┐
-│  待发送  │ ──────────▶  │  已发送  │
-│ (status=0)│              │ (status=1)│
+┌─────────────┐     Half消息      ┌─────────────┐
+│   秒杀请求   │ ──────────────▶ │  RocketMQ   │
+│             │    (预处理)       │   事务日志   │
+└──────┬──────┘                  └──────┬──────┘
+       │                                 │
+       ▼                                 │
+┌─────────────┐                          │
+│  本地事务   │                          │
+│ (扣减MySQL  │                          │
+│  创建订单)  │                          │
+└──────┬──────┘                          │
+       │   提交成功                       │
+       ├─────────────────────────────────┤
+       │                                 │
+       ▼                         发送真实消息
+                          ┌─────────────┐
+                          │  消费者订阅  │
+                          └─────────────┘
+```
+
+**事务消息状态机**
+```
+┌──────────┐   提交成功     ┌──────────┐
+│  Half   │ ────────────▶ │  Commit  │
+│  消息   │                │  (已提交) │
 └──────────┘               └──────────┘
-     ↑                          │
-     │    RocketMQ重试失败       │
-     └──────────────────────────┘
-     │                          │
-     │    定时任务扫描待发送     │
-     └──────────────────────────┘
+       │                          │
+       │   回滚/未知              │
+       ├──────────────────────────┤
+       │                          │
+       ▼                          ▼
+┌──────────┐               ┌──────────┐
+│  Rollback│               │  Commit   │
+│  (已回滚)│               │ (已提交)  │
+└──────────┘               └──────────┘
 ```
 
-**状态更新（保证幂等）**
-```sql
--- 只有status=0才能更新为1，防止并发覆盖
-UPDATE local_message SET status = 1, updated_time = NOW()
-WHERE id = ? AND status = 0;
+**事务监听器执行流程**
+```
+1. 发送Half消息成功
+2. 执行本地事务（MySQL扣减库存+创建订单）
+   - 成功 → 返回COMMIT，RocketMQ发送真实消息
+   - 失败 → 返回ROLLBACK，消息作废
+   - 超时/异常 → 返回UNKNOWN，触发回查
+3. 回查：检查订单是否存在
+   - 订单存在 → 返回COMMIT
+   - 订单不存在 → 返回ROLLBACK
 ```
 
-**定时补偿流程**
-```
-1. 扫描status=0的待发送消息
-2. 重新发送到RocketMQ
-3. 发送成功更新status=1
-4. 发送失败继续等待下次补偿
-```
+**关键代码见 4.7 节**
 
-**MQ发送失败回滚**
-```java
-try {
-    rocketMQProducer.send("seckill_topic", msg);
-    // 状态更新需要加条件，防止并发覆盖
-    localMessageMapper.updateStatusIfMatch(msg.getId(), 1, 0);
-} catch (Exception e) {
-    // RocketMQ会自动重试3次
-    // 重试全部失败后，标记状态并回滚Redis
-    localMessageMapper.updateStatus(msg.getId(), -1);
-    rollbackStockAndUser(skuId, userId);
-}
-```
+**方案对比**
+
+| 对比项 | 本地消息表+补偿 | RocketMQ事务消息 |
+|--------|-----------------|------------------|
+| 实现复杂度 | 中（需维护消息表+定时任务） | 低（MQ原生支持） |
+| 一致性 | 最终一致性 | 最终一致性 |
+| 延迟 | 定时补偿有延迟 | 实时性好 |
+| 可靠性 | 消息表+补偿双重保障 | 依赖MQ稳定性 |
+| 运维成本 | 需监控消息表 | RocketMQ高可用 |
+
+**适用场景建议**
+- 小规模秒杀：本地消息表方案足够，简单可控
+- 大规模秒杀：RocketMQ事务消息更优，减少延迟和运维成本
 
 ---
 
@@ -617,9 +728,9 @@ private boolean deductStockWithDbAndLock(String skuId, String userId) {
 | Redis Set | O(1)复杂度检查用户是否已购买 |
 | 限流防刷 | 固定窗口限流 + IP/设备维度防刷 |
 | MQ异步 | 削峰填谷，保护MySQL |
-| 本地消息表 | 保证消息可靠发送 |
+| RocketMQ事务消息 | Half消息机制保证本地事务与消息一致性 |
 | 幂等设计 | 订单号唯一索引防止重复创建 |
-| 定时补偿 | 消息补偿 + 订单超时回滚 + 库存对账 |
+| 定时任务 | 订单超时回滚 + 库存对账 |
 | 降级策略 | Redis故障时降级查MySQL |
 
 ---
@@ -633,7 +744,7 @@ private boolean deductStockWithDbAndLock(String skuId, String userId) {
 | 3 | 防刷 | IP/设备1分钟10次 |
 | 4 | 库存扣减 | Lua脚本原子操作 + MySQL WHERE stock > 0 |
 | 5 | 重复购买 | Redis Set + Lua脚本检查 |
-| 6 | MQ重试 | RocketMQ自动重试3次，失败回滚 |
+| 6 | 消息可靠性 | RocketMQ事务消息（Half消息+回查） |
 | 7 | 消费幂等 | 订单号唯一索引 |
 | 8 | 降级策略 | Redis故障降级查MySQL |
 | 9 | 订单超时 | 15分钟未支付回滚库存 |
