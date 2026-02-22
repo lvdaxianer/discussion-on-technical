@@ -224,6 +224,25 @@ private boolean checkIpDevice(String skuId, String ip, String deviceId) {
 ### 4.5 MQ消费者
 
 ```java
+@Autowired
+private RedisTemplate<String, Object> redisTemplate;
+
+/**
+ * 库存回滚Lua脚本（原子操作）
+ */
+private static final String ROLLBACK_SCRIPT = """
+    local stockKey = KEYS[1]
+    local userKey = KEYS[2]
+    local userId = ARGV[1]
+
+    -- 回滚库存
+    redis.call('incr', stockKey)
+    -- 移除用户标记
+    redis.call('srem', userKey, userId)
+
+    return 1
+    """;
+
 @RocketMQListener(topic = "seckill_topic")
 public void onMessage(SeckillMessage msg) {
     // 1. 幂等检查
@@ -234,9 +253,8 @@ public void onMessage(SeckillMessage msg) {
     // 2. MySQL库存扣减（防超卖）
     int affected = productMapper.decrementStock(msg.getSkuId());
     if (affected == 0) {
-        // 库存不足，回滚Redis
-        redis.incr("seckill:stock:" + msg.getSkuId());
-        redis.srem("seckill:users:" + msg.getSkuId(), msg.getUserId());
+        // 库存不足，原子回滚Redis（Lua脚本保证原子性）
+        rollbackStockAndUser(msg.getSkuId(), msg.getUserId());
         return;
     }
 
@@ -248,6 +266,21 @@ public void onMessage(SeckillMessage msg) {
     order.setStatus(OrderStatus.PENDING_PAY);
     order.setExpireTime(LocalDateTime.now().plusMinutes(15));
     orderMapper.insert(order);
+}
+
+/**
+ * 原子回滚库存和用户标记
+ *
+ * @param skuId  商品ID
+ * @param userId 用户ID
+ * @author lvdaxianer
+ */
+private void rollbackStockAndUser(String skuId, String userId) {
+    String stockKey = "seckill:stock:" + skuId;
+    String userKey = "seckill:users:" + skuId;
+
+    DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>(ROLLBACK_SCRIPT, Long.class);
+    redisTemplate.execute(redisScript, Arrays.asList(stockKey, userKey), userId);
 }
 ```
 
@@ -355,18 +388,35 @@ public class SeckillTransactionListener implements RocketMQLocalTransactionListe
 ### 5.1 超时订单回滚
 
 ```java
+/**
+ * 超时订单回滚Lua脚本（Redis原子操作）
+ */
+private static final String ROLLBACK_EXPIRED_SCRIPT = """
+    local stockKey = KEYS[1]
+    local userKey = KEYS[2]
+    local userId = ARGV[1]
+
+    -- 回滚库存 + 移除用户标记（原子操作）
+    redis.call('incr', stockKey)
+    redis.call('srem', userKey, userId)
+
+    return 1
+    """;
+
 @Scheduled(cron = "0 * * * * ?")
 public void rollbackExpiredOrders() {
     List<Order> expiredOrders = orderMapper.findExpiredOrders();
     for (Order order : expiredOrders) {
         orderMapper.updateStatus(order.getOrderId(), OrderStatus.CANCELLED);
 
-        // 回滚库存
-        redis.incr("seckill:stock:" + order.getSkuId());
+        // 回滚MySQL库存
         productMapper.incrementStock(order.getSkuId());
 
-        // 移除用户标记
-        redis.srem("seckill:users:" + order.getSkuId(), order.getUserId());
+        // 原子回滚Redis（Lua脚本保证原子性）
+        String stockKey = "seckill:stock:" + order.getSkuId();
+        String userKey = "seckill:users:" + order.getSkuId();
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>(ROLLBACK_EXPIRED_SCRIPT, Long.class);
+        redisTemplate.execute(redisScript, Arrays.asList(stockKey, userKey), order.getUserId());
     }
 }
 ```
