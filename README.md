@@ -2,6 +2,8 @@
 
 本文档记录了项目中各个技术方案的设计文档。
 
+> 📖 **English Version**: [README-en.md](./README-en.md)
+
 ## 文档列表
 
 | 文件名 | 说明 |
