@@ -10,6 +10,8 @@
 |--------|------|
 | [seckill-system-design.md](./docs/seckill-system-design.md) | 秒杀系统技术方案（中文） |
 | [seckill-system-design-en.md](./docs/seckill-system-design-en.md) | 秒杀系统技术方案（英文） |
+| [cache-consistency-solution.md](./docs/cache-consistency-solution.md) | DB与缓存一致性方案（中文） |
+| [cache-consistency-solution-en.md](./docs/cache-consistency-solution-en.md) | DB与缓存一致性方案（英文） |
 
 ## 文档说明
 
