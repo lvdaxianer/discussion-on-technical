@@ -6,7 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
 ### Changed
+- 补充README中DB与缓存一致性方案说明 (36534b1)
+
 - 新增DB与缓存一致性技术方案文档 (888260d)
 
 ### Changed
