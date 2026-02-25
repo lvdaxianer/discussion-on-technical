@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Changed
+- 新增DB与缓存一致性技术方案文档 (888260d)
+
+### Changed
+- 添加英文README实现中英文文档互相跳转 (359e939)
+
 - 修复Redis库存回滚非原子性问题 (f6866ae)
 
 ### Changed
