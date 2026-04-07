@@ -12,6 +12,8 @@ This documentation records the technical design documents for the project.
 | [seckill-system-design-en.md](./docs/seckill-system-design-en.md) | Seckill System Design (English) |
 | [cache-consistency-solution.md](./docs/cache-consistency-solution.md) | DB and Cache Consistency (Chinese) |
 | [cache-consistency-solution-en.md](./docs/cache-consistency-solution-en.md) | DB and Cache Consistency (English) |
+| [skill-recommend-system.md](./docs/skill-recommend-system.md) | Skill Feature Extraction and Match (Chinese) |
+| [skill-recommend-system-en.md](./docs/skill-recommend-system-en.md) | Skill Feature Extraction and Match (English) |
 
 ## Document Description
 

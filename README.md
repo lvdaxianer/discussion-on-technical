@@ -12,6 +12,8 @@
 | [seckill-system-design-en.md](./docs/seckill-system-design-en.md) | 秒杀系统技术方案（英文） |
 | [cache-consistency-solution.md](./docs/cache-consistency-solution.md) | DB与缓存一致性方案（中文） |
 | [cache-consistency-solution-en.md](./docs/cache-consistency-solution-en.md) | DB与缓存一致性方案（英文） |
+| [skill-recommend-system.md](./docs/skill-recommend-system.md) | Skill特征提取与匹配系统（中文） |
+| [skill-recommend-system-en.md](./docs/skill-recommend-system-en.md) | Skill特征提取与匹配系统（英文） |
 
 ## 文档说明
 
@@ -49,3 +51,15 @@
 - **方案对比总结**：各方案的优缺点和适用场景
 
 ---
+
+### Skill特征提取与匹配系统
+
+该文档详细描述了基于 LangChain 的 Skill 特征提取与匹配推荐系统，包括：
+
+- **问题背景**：用户上传 Skill 后，系统自动识别并推荐最相关的 Skill
+- **输入类型**：skill描述、对话上下文、用户问题、技术文档
+- **系统架构**：LangChain Chain + ChromaDB 向量存储 + FastAPI
+- **核心模块**：特征提取（LLM）、向量存储（ChromaDB）、多路召回匹配（Jaccard + 向量）
+- **技术栈**：langchain + langchain-openai + chromadb + fastapi
+- **API 接口**：注册 Skill、推荐 Skill、健康检查
+- **部署步骤**：依赖安装、环境配置、服务启动
